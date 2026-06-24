@@ -12,7 +12,7 @@ minimal [Pi](https://pi.dev) harness explores the dataroom with local tools such
 
 ## Why
 
-Everyone who knows me knows I'm super test-time-compute-pilled. In my view, **search is test-time compute (TTC)**: you wire trained embeddings, rerankers, single-/multi-vector retrievers, and query expanders into a pipeline to squeeze out relevancy. Don't scale TTC, say a keyword search hands you the answer, and it's probably not good enough. Scale it, say add embedding search then filter with a reranker, and you most likely get a better one. So I built `searchbox` as a testbed to explore a few questions on TTC:
+Everyone who knows me knows I'm super test-time-com"pilled". In my view, **search is test-time compute (TTC)**: you wire trained embeddings, rerankers, multi-vector retrievers, query expanders into a pipeline at test-time to squeeze out relevancy. Don't scale TTC, say a keyword search hands you the answer, and it's probably not good enough. Scale it, say add embedding search then filter with a reranker, and you most likely get a better one. So I built `searchbox` as a testbed to explore a few questions on TTC:
 
 - Model preferences: which tool does it reach for in agentic search?
 - [Is grep really all you need](https://arxiv.org/abs/2605.15184), i.e. where does a dense retriever add nothing to search quality?
