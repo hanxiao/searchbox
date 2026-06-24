@@ -230,8 +230,19 @@ def drive(job_dir, work_dir, agent_dir, dataroom_dir, args, budget):
            "--append-system-prompt", build_system_task(),
            "--extension", str(REPO / "pi" / "extensions" / "dataroom-search.ts")]
     # On resume, continue the prior pi session (same agent_dir) instead of starting fresh.
+    # Bind to the EXACT session file rather than --continue ("most recent"): the token accounting
+    # in session_usage() reads session_file() = newest jsonl by mtime, and pi --continue picks the
+    # most-recent session. Those happen to agree today (one session per isolated agent_dir), but
+    # that is an implicit coupling. Pinning --session <path> makes resume + accounting provably
+    # read the SAME file, so a preempted run prefills from its real history and the final token
+    # total / answer evolution match an uninterrupted N-turn run. Fall back to --continue only if
+    # no session file is found yet (shouldn't happen on a real resume).
     if getattr(args, "resume", False):
-        cmd.append("--continue")
+        prior_sess = session_file(agent_dir)
+        if prior_sess is not None:
+            cmd += ["--session", str(prior_sess)]
+        else:
+            cmd.append("--continue")
     log = open(job_dir / "pi.log", "a")
     log.write(f"\n\n===== RPC SESSION @ {time.ctime()} =====\n"); log.flush()
     log_path = job_dir / "pi.log"
