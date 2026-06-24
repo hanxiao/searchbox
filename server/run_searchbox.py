@@ -53,12 +53,23 @@ def free_port() -> int:
 
 
 def write_pi_config(agent_dir: Path, llama_url: str):
-    """Per-job Pi config: default model = the configured local model. Compaction left ON
-    (Pi's own, default settings) - we do not tune it."""
+    """Per-job Pi config: default model = the configured local model.
+
+    Compaction is ON. We DO tune reserveTokens: Pi auto-compacts when
+    contextTokens > contextWindow - reserveTokens (default reserve 16384, so trigger ~114688 of
+    131072). But compaction itself calls the LLM to summarize, and that request carries
+    keepRecentTokens (~20000) of recent context PLUS the history to summarize PLUS maxTokens of
+    output. With only ~16k headroom the summarization request itself overflows the context window
+    -> 'Auto-compaction failed: Summarization failed: Context size has been exceeded' (observed on
+    long/resumed jobs). Fixing by triggering compaction EARLIER (larger reserveTokens) so the
+    summarization call has room. reserve 40000 -> trigger ~91072, leaving ~40k for the summary
+    request. Tunable via COMPACTION_RESERVE_TOKENS."""
     agent_dir.mkdir(parents=True, exist_ok=True)
     ctx = int(os.environ.get("CONTEXT_WINDOW", os.environ.get("CTX_SIZE", "131072")))
     model_id = os.environ.get("MODEL_ID", "qwen3.6")
     max_tokens = int(os.environ.get("MAX_OUTPUT_TOKENS", "8192"))
+    compaction_reserve = int(os.environ.get("COMPACTION_RESERVE_TOKENS", "40000"))
+    compaction_keep_recent = int(os.environ.get("COMPACTION_KEEP_RECENT_TOKENS", "20000"))
     (agent_dir / "models.json").write_text(json.dumps({
         "providers": {
             "local": {
@@ -75,6 +86,12 @@ def write_pi_config(agent_dir: Path, llama_url: str):
         "defaultModel": model_id,
         "defaultThinkingLevel": os.environ.get("THINKING_LEVEL", "high"),
         "enableInstallTelemetry": False,
+        # Trigger auto-compaction earlier so the summarization request itself fits (see docstring).
+        "compaction": {
+            "enabled": True,
+            "reserveTokens": compaction_reserve,
+            "keepRecentTokens": compaction_keep_recent,
+        },
     }, indent=2))
 
 
