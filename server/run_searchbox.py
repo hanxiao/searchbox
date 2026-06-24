@@ -43,6 +43,10 @@ REPO = HERE.parent
 BUDGET_METRIC = os.environ.get("BUDGET_METRIC", "input")
 
 
+class _BudgetAlreadySpent(Exception):
+    """Resume re-entered drive() with the turn budget already fully used; stop without a cycle."""
+
+
 def free_port() -> int:
     s = socket.socket(); s.bind(("127.0.0.1", 0)); p = s.getsockname()[1]; s.close()
     return p
@@ -309,6 +313,38 @@ def drive(job_dir, work_dir, agent_dir, dataroom_dir, args, budget):
     turns_jsonl = snap_dir / "turns.jsonl"
     last_answer = {"body": None}  # body of the most recently SAVED ANSWER-t*.md
 
+    # RESUME CONTINUITY: turns.jsonl and ANSWER-t*.md persist across preempt/resume cycles
+    # (each resume re-enters drive()). The driver's turn counter must CONTINUE from the highest
+    # turn already recorded, not restart at 0 - otherwise a preempted job writes turn 1,2,3...
+    # again and turns.jsonl ends up like [1..5][1..9][1..10] (duplicate/garbage turn ids).
+    # Likewise last_answer must be seeded from the last saved snapshot so the change-dedup keeps
+    # working across the boundary (else the first turn after resume always re-saves a dup).
+    def _prior_turn_and_answer():
+        max_turn = 0
+        if turns_jsonl.exists():
+            try:
+                for line in turns_jsonl.read_text(errors="ignore").splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    t = json.loads(line).get("turn")
+                    if isinstance(t, int) and t > max_turn:
+                        max_turn = t
+            except Exception:
+                pass
+        body = None
+        try:
+            snaps = sorted(snap_dir.glob("ANSWER-t*.md"),
+                           key=lambda p: int(p.stem[len("ANSWER-t"):]) if p.stem[len("ANSWER-t"):].isdigit() else -1)
+            if snaps:
+                body = snaps[-1].read_text(errors="ignore")
+        except Exception:
+            pass
+        return max_turn, body
+
+    prior_turn, prior_body = _prior_turn_and_answer()
+    last_answer["body"] = prior_body
+
     def snapshot(turn_no: int, spent: int, usage: dict, elapsed: float):
         try:
             ans = work_dir / "ANSWER.md"
@@ -342,7 +378,8 @@ def drive(job_dir, work_dir, agent_dir, dataroom_dir, args, budget):
             pass
 
     start = time.time()
-    turn, stop_reason = 0, "error_pi_exited"
+    # Continue the global turn counter across resumes (see _prior_turn_and_answer above).
+    turn, stop_reason = prior_turn, "error_pi_exited"
     sfile = None
 
     def spent_now():
@@ -373,6 +410,11 @@ def drive(job_dir, work_dir, agent_dir, dataroom_dir, args, budget):
             return ""
 
     try:
+        # If a resume re-entered drive() with the turn budget already fully spent (e.g. the run
+        # was preempted right at completion), don't run another wasted cycle - stop immediately.
+        if args.force_budget and turn >= budget:
+            stop_reason = "budget_spent"
+            raise _BudgetAlreadySpent()
         while True:
             cycle_wd = threading.Timer(max(1, args.turn_timeout), lambda: send({"type": "abort"}))
             cycle_wd.start()
@@ -441,6 +483,8 @@ def drive(job_dir, work_dir, agent_dir, dataroom_dir, args, budget):
                 stop_reason = "budget_spent"; break
 
             send({"type": "prompt", "message": KEEP_GOING})
+    except _BudgetAlreadySpent:
+        pass
     except KeyboardInterrupt:
         stop_reason = "interrupted"
     finally:
