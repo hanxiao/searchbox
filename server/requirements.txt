@@ -13,3 +13,8 @@ sentence-transformers==5.5.1
 peft==0.19.1
 einops
 # torch is provided by the base image / installed separately; do not pin here.
+# Binary-document text extraction for the dataroom index (pdf/xlsx/docx). Without these the
+# index silently skips binary docs -> scope_chunks:0 -> no grounding. Pure-python, no system deps.
+pypdf>=4.0
+openpyxl>=3.1
+python-docx>=1.1

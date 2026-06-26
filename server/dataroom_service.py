@@ -75,10 +75,17 @@ DEFAULT_GLOBS = (
     "**/*.tsv", "**/*.html", "**/*.htm", "**/*.xml", "**/*.tex", "**/*.c", "**/*.h",
     "**/*.cpp", "**/*.cc", "**/*.go", "**/*.rs", "**/*.java", "**/*.sql", "**/*.sh",
     "**/*.ipynb", "**/*.log", "**/*.cfg", "**/*.ini", "**/*.env",
+    # Binary document formats: text is extracted on read (see _read_text). Without these the
+    # dataroom (often ALL pdf/xlsx, e.g. regulatory filings) indexes 0 files -> every /search
+    # returns scope_chunks:0 -> the model gets no grounding and hallucinates.
+    "**/*.pdf", "**/*.xlsx", "**/*.xls", "**/*.docx",
 )
 _globs_env = os.environ.get("DATAROOM_GLOBS", "").strip()
 INDEX_GLOBS = tuple(g.strip() for g in _globs_env.split(",") if g.strip()) or DEFAULT_GLOBS
+# Binary docs pack more bytes per unit of content; allow a higher ceiling for them.
 MAX_FILE_BYTES = int(os.environ.get("MAX_FILE_BYTES", str(4 * 1024 * 1024)))  # skip huge blobs
+MAX_DOC_BYTES = int(os.environ.get("MAX_DOC_BYTES", str(32 * 1024 * 1024)))   # pdf/xlsx/docx ceiling
+_DOC_EXTS = (".pdf", ".xlsx", ".xls", ".docx")
 
 app = FastAPI()
 
@@ -259,14 +266,78 @@ def _dataroom_files() -> list:
         for ap in glob.glob(os.path.join(DATAROOM_DIR, g), recursive=True):
             if not os.path.isfile(ap) or ap in seen:
                 continue
+            # Binary docs get a higher size ceiling than plain text (they pack more bytes).
+            cap = MAX_DOC_BYTES if ap.lower().endswith(_DOC_EXTS) else MAX_FILE_BYTES
             try:
-                if os.path.getsize(ap) > MAX_FILE_BYTES:
+                if os.path.getsize(ap) > cap:
                     continue
             except OSError:
                 continue
             seen.add(ap)
             found.append(ap)
     return sorted(found)
+
+
+# --- text extraction for binary docs -----------------------------------------
+_extract_warned = set()
+
+
+def _extract_pdf(ap: str) -> str:
+    from pypdf import PdfReader
+    reader = PdfReader(ap)
+    parts = []
+    for page in reader.pages:
+        try:
+            parts.append(page.extract_text() or "")
+        except Exception:
+            continue
+    return "\n".join(parts)
+
+
+def _extract_xlsx(ap: str) -> str:
+    from openpyxl import load_workbook
+    wb = load_workbook(ap, read_only=True, data_only=True)
+    parts = []
+    for ws in wb.worksheets:
+        parts.append(f"# Sheet: {ws.title}")
+        for row in ws.iter_rows(values_only=True):
+            cells = [str(c) for c in row if c is not None]
+            if cells:
+                parts.append("\t".join(cells))
+    wb.close()
+    return "\n".join(parts)
+
+
+def _extract_docx(ap: str) -> str:
+    import docx
+    d = docx.Document(ap)
+    parts = [p.text for p in d.paragraphs if p.text]
+    for tbl in d.tables:
+        for row in tbl.rows:
+            cells = [c.text for c in row.cells if c.text]
+            if cells:
+                parts.append("\t".join(cells))
+    return "\n".join(parts)
+
+
+def _read_text(ap: str) -> str:
+    """Return indexable text for a dataroom file. Plain-text files are read as-is; binary
+    documents (pdf/xlsx/docx) are extracted. Extraction failures degrade to empty (skipped),
+    logged once per path, so one unreadable doc never kills the whole scope build."""
+    low = ap.lower()
+    try:
+        if low.endswith(".pdf"):
+            return _extract_pdf(ap)
+        if low.endswith((".xlsx", ".xls")):
+            return _extract_xlsx(ap)
+        if low.endswith(".docx"):
+            return _extract_docx(ap)
+        return open(ap, errors="ignore").read()
+    except Exception as e:
+        if ap not in _extract_warned:
+            _extract_warned.add(ap)
+            print(f"WARN: text extraction failed for {ap}: {e}", flush=True)
+        return ""
 
 
 def _resolve_paths(paths) -> list:
@@ -328,9 +399,8 @@ def _build_scope(files: list, size: int, overlap: int):
     """Read+chunk+embed the given files NOW. Returns (embs (N,D) normalized, meta list)."""
     texts, meta = [], []
     for ap in files:
-        try:
-            raw = open(ap, errors="ignore").read()
-        except Exception:
+        raw = _read_text(ap)
+        if not raw or not raw.strip():
             continue
         rel = os.path.relpath(ap, DATAROOM_DIR)
         for ci, c in enumerate(chunk(raw, size, overlap)):

@@ -198,7 +198,30 @@ def count_tool_calls(log_path: Path) -> int:
     return sum(1 for raw in open(log_path, "rb") if b'"type":"tool_execution_start"' in raw)
 
 
+def reconcile_answer(work_dir: Path) -> None:
+    """The model is told to write ANSWER.md in its working dir (pi's cwd = work_dir). But some
+    models (observed: qwen3.6) call write with an ABSOLUTE path '/ANSWER.md', which pi honors
+    verbatim -> the file lands at filesystem root, NOT in work_dir. The dashboard, snapshots,
+    and the judge only read work_dir/ANSWER.md, so the run looks answer-less even though the
+    model answered. Pull any stray ANSWER.md into work_dir if work_dir's own is missing/empty.
+    Checked locations, in order of preference: filesystem root, and work_dir's parent (job_dir)."""
+    target = work_dir / "ANSWER.md"
+    if target.exists() and target.stat().st_size > 0:
+        return
+    for cand in (Path("/ANSWER.md"), work_dir.parent / "ANSWER.md"):
+        try:
+            if cand.resolve() == target.resolve():
+                continue
+            if cand.exists() and cand.stat().st_size > 0:
+                target.write_text(cand.read_text(errors="ignore"))
+                print(f"NOTE: relocated stray answer {cand} -> {target}", flush=True)
+                return
+        except Exception:
+            continue
+
+
 def answer_present(work_dir: Path) -> bool:
+    reconcile_answer(work_dir)
     a = work_dir / "ANSWER.md"
     return a.exists() and a.stat().st_size > 200
 
@@ -214,8 +237,21 @@ SYSTEM_TASK_TMPL = (
     "Today is {today}.\n"
     "Answer the question below using the dataroom/ folder in your working directory as your "
     "source. You have no network access. You can use all tools you have or build new tools or "
-    "workflow using existing tools. Write your final answer to ANSWER.md in the working "
-    "directory (not inside dataroom/)."
+    "workflow using existing tools.\n"
+    "\n"
+    "IMPORTANT - how tools relate to your answer:\n"
+    "- search_dataroom and answer_question are RETRIEVAL tools only. They return candidate "
+    "passages from the dataroom (answer_question additionally reranks them). They do NOT write "
+    "or submit your answer, and calling them is NOT answering the question - they only give you "
+    "evidence to read.\n"
+    "- You MUST write your own final answer, in your own words, to a file named ANSWER.md in the "
+    "working directory (not inside dataroom/). Write it with the RELATIVE path ANSWER.md (your "
+    "current working directory), NOT an absolute path like /ANSWER.md. The contents of ANSWER.md "
+    "is the ONLY thing that counts as your answer. If you never write ANSWER.md, you have not "
+    "answered.\n"
+    "- Keep ANSWER.md to the actual answer. Do not paste raw tool output / JSON / file paths "
+    "into it. Write a direct, self-contained answer to the question.\n"
+    "- Make sure ANSWER.md exists and contains your final answer before you stop."
 )
 
 
@@ -375,6 +411,7 @@ def drive(job_dir, work_dir, agent_dir, dataroom_dir, args, budget):
 
     def snapshot(turn_no: int, spent: int, usage: dict, elapsed: float):
         try:
+            reconcile_answer(work_dir)  # pull a stray /ANSWER.md into work_dir before reading
             ans = work_dir / "ANSWER.md"
             body = ans.read_text(errors="ignore") if ans.exists() else ""
             ans_chars = len(body)
@@ -467,14 +504,12 @@ def drive(job_dir, work_dir, agent_dir, dataroom_dir, args, budget):
                 cycle_wd.cancel()
             flush_timing(round((time.time() - start) * 1000))
 
-            # The model is asked to write ANSWER.md itself (drives the read->edit loop). As a
-            # BACKSTOP, if it has not produced ANSWER.md yet, save its final non-thinking message
-            # this turn so a run always yields an answer. Never clobber a model-written file.
-            if turn_text and not ans_path.exists():
-                try:
-                    ans_path.write_text(turn_text)
-                except Exception:
-                    pass
+            # ANSWER policy (thin harness): the ONLY accepted answer is the file the model
+            # writes to ANSWER.md itself. We deliberately do NOT backstop-capture the model's
+            # last chat message: that captured tool-output JSON / raw file paths (qwen often
+            # echoes search_dataroom results as its final text) and fed garbage to the judge.
+            # If the model never wrote ANSWER.md, the answer is legitimately empty and the judge
+            # scores it as such - an honest no-answer, not a fabricated one.
 
             if not ended:
                 stop_reason = hard["reason"] or "error_pi_exited"; break
