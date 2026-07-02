@@ -9,3 +9,4 @@ models/
 .corpus_cache/
 *.log
 .DS_Store
+.idea
