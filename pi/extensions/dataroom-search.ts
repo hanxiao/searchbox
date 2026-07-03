@@ -22,6 +22,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 const BASE = process.env.DATAROOM_INDEX_URL || "http://127.0.0.1:8078";
+const TOOL_TIMEOUT_MS = Number(process.env.DATAROOM_TOOL_TIMEOUT_MS || 900000);
 
 // Tool catalog: single source of truth (pi/tools-catalog.json). ~20 tools, every one a thin
 // wrapper over the embedding/reranking backend in dataroom_service.py.
@@ -63,14 +64,24 @@ const enabled = (name: string) => {
 };
 
 async function call(op: string, body: Record<string, unknown>): Promise<string> {
-  const res = await fetch(`${BASE}/${op}`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  const text = await res.text();
-  if (!res.ok) throw new Error(`dataroom service ${op} -> ${res.status}: ${text}`);
-  return text;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), TOOL_TIMEOUT_MS);
+  try {
+    const res = await fetch(`${BASE}/${op}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+      signal: ctrl.signal,
+    });
+    const text = await res.text();
+    if (!res.ok) throw new Error(`dataroom service ${op} -> ${res.status}: ${text}`);
+    return text;
+  } catch (e: any) {
+    const msg = String(e?.message || e);
+    throw new Error(`dataroom service ${op} fetch failed after ${TOOL_TIMEOUT_MS}ms: ${msg}`);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function ok(text: string) {

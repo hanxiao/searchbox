@@ -140,12 +140,25 @@ def _iter_events(log_path: Path):
 
 
 # Primary "what" argument per tool, in priority order. First present one is shown quoted.
-_PRIMARY_ARGS = ("query", "question", "topic", "claim", "text", "prompt")
+_PRIMARY_ARGS = ("query", "question", "url", "topic", "claim", "text", "prompt")
 # Numeric/scalar params worth surfacing as key=value suffixes.
 _SCALAR_ARGS = ("k", "top_n", "threshold", "role", "out")
 # List params: show name + length, e.g. documents=12.
 _LIST_ARGS = ("texts", "documents", "passages", "candidates", "items", "strings",
               "labels", "a", "b", "queries", "paths")
+
+
+def _one_line(text: str, limit: int = 1000) -> str:
+    """Compact a tool argument for the live dashboard without hiding ordinary questions.
+
+    The UI already clips visually with CSS and exposes the full value in a title tooltip. Avoid
+    short server-side truncation here; otherwise the dashboard makes complete tool calls look like
+    the agent actually sent cut-off retrieval questions.
+    """
+    text = re.sub(r"\s+", " ", str(text)).strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit - 3].rstrip() + "..."
 
 
 def _summarize(tool: str, args) -> str:
@@ -161,7 +174,7 @@ def _summarize(tool: str, args) -> str:
         for k in _PRIMARY_ARGS:
             v = a.get(k)
             if isinstance(v, str) and v.strip():
-                parts.append(f'"{v.strip()[:80]}"')
+                parts.append(f'"{_one_line(v)}"')
                 break
         for k in _LIST_ARGS:
             v = a.get(k)

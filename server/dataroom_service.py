@@ -20,7 +20,8 @@ Endpoints (POST JSON):
   /rerank  {query, documents[], top_n?}                          -> reranker-v3 ordering
   /stats   {}                                                    -> {files, file_count, models}
 """
-import os, json, glob, hashlib, time
+import os, json, glob, hashlib, re, time
+import threading
 import numpy as np
 from fastapi import FastAPI, Request
 import urllib.request
@@ -52,6 +53,9 @@ RERANK_MODEL = os.environ.get("RERANK_MODEL", "jinaai/jina-reranker-v3")
 EMBED_TASK = os.environ.get("EMBED_TASK", "retrieval")
 CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", "1400"))
 CHUNK_OVERLAP = int(os.environ.get("CHUNK_OVERLAP", "180"))
+SEARCH_MAX_EMBED_CHUNKS = int(os.environ.get("SEARCH_MAX_EMBED_CHUNKS", "16"))
+ANSWER_MAX_EMBED_CHUNKS = int(os.environ.get("ANSWER_MAX_EMBED_CHUNKS", "24"))
+ANSWER_FETCH_K_MAX = int(os.environ.get("ANSWER_FETCH_K_MAX", "8"))
 
 # Where /embed writes its jsonl output. This is the model's sandbox cwd (parent of dataroom/), so
 # the model can read the file back with a plain relative path (cat / python). Falls back to CWD.
@@ -92,11 +96,13 @@ app = FastAPI()
 
 _embed_model = None
 _rerank_model = None
+_model_lock = threading.Lock()
 _force_cpu = {"embed": False, "rerank": False}
 # Lazy per-scope index cache: key (paths tuple, chunk_size, overlap) -> {embs, meta}. Built only
 # when /search is first called for that scope; nothing exists until the model asks. Cleared via
 # nothing - it just lives for the process. No boot index, no on-disk precompute.
 _scope_cache: dict = {}
+_text_scope_cache: dict = {}
 
 # OPENCLAW_EMBED_CACHE: precise per-(text,role) embedding cache. Content-keyed (exact string match),
 # so identical passages/queries across turns and across tools are embedded at most once per
@@ -164,18 +170,20 @@ def _target_device(role: str) -> str:
 def embed_model():
     global _embed_model
     if _embed_model is None:
-        from sentence_transformers import SentenceTransformer
-        dev = _target_device("embed")
-        print(f"[dataroom] loading embed model {EMBED_MODEL} on {dev}", flush=True)
-        try:
-            _embed_model = SentenceTransformer(EMBED_MODEL, device=dev, trust_remote_code=True)
-        except Exception as e:
-            if dev != "cpu" and _is_accelerator_error(e):
-                _force_cpu["embed"] = True
-                print(f"[dataroom] embed {dev} load failed ({e}); offloading to CPU", flush=True)
-                _embed_model = SentenceTransformer(EMBED_MODEL, device="cpu", trust_remote_code=True)
-            else:
-                raise
+        with _model_lock:
+            if _embed_model is None:
+                from sentence_transformers import SentenceTransformer
+                dev = _target_device("embed")
+                print(f"[dataroom] loading embed model {EMBED_MODEL} on {dev}", flush=True)
+                try:
+                    _embed_model = SentenceTransformer(EMBED_MODEL, device=dev, trust_remote_code=True)
+                except Exception as e:
+                    if dev != "cpu" and _is_accelerator_error(e):
+                        _force_cpu["embed"] = True
+                        print(f"[dataroom] embed {dev} load failed ({e}); offloading to CPU", flush=True)
+                        _embed_model = SentenceTransformer(EMBED_MODEL, device="cpu", trust_remote_code=True)
+                    else:
+                        raise
     return _embed_model
 
 
@@ -185,33 +193,35 @@ def rerank_model():
     .rerank(query, documents, top_n=...). Auto GPU->CPU offload on OOM / full card."""
     global _rerank_model
     if _rerank_model is None:
-        from transformers import AutoModel, AutoModelForSequenceClassification
-        dev = _target_device("rerank")
-        print(f"[dataroom] loading rerank model {RERANK_MODEL} on {dev}", flush=True)
-        last = None
-        m = None
-        for loader in (AutoModel, AutoModelForSequenceClassification):
-            try:
-                m = loader.from_pretrained(RERANK_MODEL, dtype="auto", trust_remote_code=True)
-                if hasattr(m, "rerank"):
-                    break
-                m = None  # loaded but wrong class (no .rerank); try the next loader
-            except Exception as e:
-                last = e
-                continue
-        if m is None:
-            raise RuntimeError(f"could not load a reranker with .rerank() for {RERANK_MODEL}: {last}")
-        m.eval()
-        if dev != "cpu":
-            try:
-                m = m.to(dev)
-            except Exception as e:
-                if _is_accelerator_error(e):
-                    _force_cpu["rerank"] = True
-                    print(f"[dataroom] rerank {dev} move failed ({e}); staying on CPU", flush=True)
-                else:
-                    raise
-        _rerank_model = m
+        with _model_lock:
+            if _rerank_model is None:
+                from transformers import AutoModel, AutoModelForSequenceClassification
+                dev = _target_device("rerank")
+                print(f"[dataroom] loading rerank model {RERANK_MODEL} on {dev}", flush=True)
+                last = None
+                m = None
+                for loader in (AutoModel, AutoModelForSequenceClassification):
+                    try:
+                        m = loader.from_pretrained(RERANK_MODEL, dtype="auto", trust_remote_code=True)
+                        if hasattr(m, "rerank"):
+                            break
+                        m = None  # loaded but wrong class (no .rerank); try the next loader
+                    except Exception as e:
+                        last = e
+                        continue
+                if m is None:
+                    raise RuntimeError(f"could not load a reranker with .rerank() for {RERANK_MODEL}: {last}")
+                m.eval()
+                if dev != "cpu":
+                    try:
+                        m = m.to(dev)
+                    except Exception as e:
+                        if _is_accelerator_error(e):
+                            _force_cpu["rerank"] = True
+                            print(f"[dataroom] rerank {dev} move failed ({e}); staying on CPU", flush=True)
+                        else:
+                            raise
+                _rerank_model = m
     return _rerank_model
 
 
@@ -456,6 +466,85 @@ def _build_scope(files: list, size: int, overlap: int):
     return embs, meta
 
 
+def _get_text_scope(files: list, size: int, overlap: int) -> list:
+    """Read + chunk the scope once, without embedding it.
+
+    On CPU droplets, embedding every chunk before each high-level search can exceed the tool
+    timeout. Keeping text chunks cached lets /search cheaply lexical-prefilter first, then embed
+    only the most plausible candidates with the local model.
+    """
+    key = (tuple(sorted(os.path.relpath(f, DATAROOM_DIR) for f in files)), size, overlap)
+    cached = _text_scope_cache.get(key)
+    if cached is not None:
+        return cached
+    meta = []
+    t0 = time.time()
+    for ap in files:
+        raw = _read_text(ap)
+        if not raw or not raw.strip():
+            continue
+        rel = os.path.relpath(ap, DATAROOM_DIR)
+        for ci, c in enumerate(chunk(raw, size, overlap)):
+            meta.append({"path": rel, "chunk": ci, "text": c})
+    _text_scope_cache[key] = meta
+    print(f"[dataroom] text scope: {len(files)} files -> {len(meta)} chunks "
+          f"(size={size}, overlap={overlap}) in {time.time()-t0:.1f}s", flush=True)
+    return meta
+
+
+def _query_terms(q: str) -> list[str]:
+    terms = [t for t in re.findall(r"[a-z0-9][a-z0-9_-]{2,}", q.lower())
+             if t not in {"the", "and", "for", "with", "from", "about", "into", "using"}]
+    expanded = []
+    for t in terms:
+        expanded.append(t)
+        if t == "defense":
+            expanded.append("defence")
+        elif t == "defence":
+            expanded.append("defense")
+    return list(dict.fromkeys(expanded))
+
+
+def _candidate_indexes(q: str, meta: list, limit: int) -> list[int]:
+    """Return query-specific candidate chunk indexes for local embedding/reranking.
+
+    This is intentionally lexical and cheap. The local embedder still decides the final semantic
+    order, but only over a bounded candidate set so first-search latency is sane without a GPU.
+    """
+    if not meta:
+        return []
+    limit = max(1, min(int(limit or len(meta)), len(meta)))
+    if len(meta) <= limit:
+        return list(range(len(meta)))
+    terms = _query_terms(q)
+    phrase = q.lower().strip()
+    scored = []
+    for i, m in enumerate(meta):
+        hay = (m["path"] + "\n" + m["text"]).lower()
+        score = 0.0
+        if phrase and phrase in hay:
+            score += 8.0
+        for t in terms:
+            path_hits = m["path"].lower().count(t)
+            text_hits = hay.count(t)
+            if path_hits:
+                score += 3.0 * path_hits
+            if text_hits:
+                score += min(6.0, float(text_hits))
+        scored.append((score, i))
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    if scored and scored[0][0] > 0:
+        return [i for _, i in scored[:limit]]
+    return list(range(limit))
+
+
+def _log_query(q: str, limit: int = 500) -> str:
+    q = re.sub(r"\s+", " ", str(q)).strip()
+    if len(q) <= limit:
+        return q
+    return q[:limit - 3].rstrip() + "..."
+
+
 # --- endpoints ---------------------------------------------------------------
 @app.post("/search")
 async def search(req: Request):
@@ -477,30 +566,28 @@ async def search(req: Request):
     if not files:
         return {"results": [], "scope_chunks": 0}
 
-    # Memoize this exact scope for the run so repeated identical searches don't re-embed.
-    # Built lazily here on first use - never at boot.
-    key = (tuple(sorted(os.path.relpath(f, DATAROOM_DIR) for f in files)), size, overlap)
-    cached = _scope_cache.get(key)
-    if cached is None:
-        t0 = time.time()
-        embs, meta = _build_scope(files, size, overlap)
-        _scope_cache[key] = cached = {"embs": embs, "meta": meta}
-        print(f"[dataroom] on-the-fly embed: {len(files)} files -> {len(meta)} chunks "
-              f"(size={size}, overlap={overlap}) in {time.time()-t0:.1f}s", flush=True)
-    embs, meta = cached["embs"], cached["meta"]
-    if embs is None or embs.shape[0] == 0:
+    meta = _get_text_scope(files, size, overlap)
+    if not meta:
         return {"results": [], "scope_chunks": 0}
+    cand_idx = _candidate_indexes(q, meta, int(body.get("max_embed_chunks", SEARCH_MAX_EMBED_CHUNKS)))
+    cand_meta = [meta[i] for i in cand_idx]
+    print(f"[dataroom] search request: files={len(files)} chunks={len(meta)} "
+          f"embedding={len(cand_meta)} q={_log_query(q)!r}", flush=True)
+    t0 = time.time()
+    embs = _encode([m["text"] for m in cand_meta], role="passage")
+    print(f"[dataroom] search embed: {len(cand_meta)} chunks in {time.time()-t0:.1f}s", flush=True)
 
     qe = _encode([q], role="query")[0]
     sims = embs @ qe
     order = np.argsort(-sims)[:k]
     results = [{
-        "path": meta[i]["path"],
-        "chunk": int(meta[i]["chunk"]),
+        "path": cand_meta[i]["path"],
+        "chunk": int(cand_meta[i]["chunk"]),
         "score": round(float(sims[i]), 4),
-        "text": meta[i]["text"],
+        "text": cand_meta[i]["text"],
     } for i in order]
-    return {"results": results, "scope_chunks": int(embs.shape[0]), "scope_files": len(files)}
+    return {"results": results, "scope_chunks": len(meta), "embedded_chunks": len(cand_meta),
+            "scope_files": len(files)}
 
 
 @app.post("/answer")
@@ -514,33 +601,39 @@ async def answer(req: Request):
     if not q:
         return {"results": [], "scope_chunks": 0}
     k = int(body.get("k", 5))
-    fetch_k = int(body.get("fetch_k", max(20, k * 6)))
+    fetch_default = max(k, min(ANSWER_FETCH_K_MAX, max(8, k * 3)))
+    fetch_k = max(k, min(int(body.get("fetch_k", fetch_default)), ANSWER_FETCH_K_MAX))
     size = int(body.get("chunk_size", CHUNK_SIZE))
     overlap = int(body.get("chunk_overlap", CHUNK_OVERLAP))
     files = _resolve_paths(body.get("paths"))
     if not files:
         return {"results": [], "scope_chunks": 0}
-    key = (tuple(sorted(os.path.relpath(f, DATAROOM_DIR) for f in files)), size, overlap)
-    cached = _scope_cache.get(key)
-    if cached is None:
-        embs, meta = _build_scope(files, size, overlap)
-        _scope_cache[key] = cached = {"embs": embs, "meta": meta}
-    embs, meta = cached["embs"], cached["meta"]
-    if embs is None or embs.shape[0] == 0:
+    meta = _get_text_scope(files, size, overlap)
+    if not meta:
         return {"results": [], "scope_chunks": 0}
+    cand_idx = _candidate_indexes(q, meta, int(body.get("max_embed_chunks", ANSWER_MAX_EMBED_CHUNKS)))
+    cand_meta = [meta[i] for i in cand_idx]
+    print(f"[dataroom] answer request: files={len(files)} chunks={len(meta)} "
+          f"embedding={len(cand_meta)} fetch_k={fetch_k} q={_log_query(q)!r}", flush=True)
+    t0 = time.time()
+    embs = _encode([m["text"] for m in cand_meta], role="passage")
+    print(f"[dataroom] answer embed: {len(cand_meta)} chunks in {time.time()-t0:.1f}s", flush=True)
     # stage 1: dense retrieve wide
     qe = _encode([q], role="query")[0]
     sims = embs @ qe
     cand = np.argsort(-sims)[:fetch_k]
-    cand_texts = [meta[i]["text"] for i in cand]
+    cand_texts = [cand_meta[i]["text"] for i in cand]
     # stage 2: cross-encoder rerank narrow
+    t0 = time.time()
     ranked = _rerank_texts(q, cand_texts, top_n=k)
+    print(f"[dataroom] answer rerank: {len(cand_texts)} chunks in {time.time()-t0:.1f}s", flush=True)
     results = []
     for r in ranked:
         ci = cand[int(r["index"])]
-        results.append({"path": meta[ci]["path"], "chunk": int(meta[ci]["chunk"]),
-                        "score": round(float(r["score"]), 4), "text": meta[ci]["text"]})
-    return {"results": results, "scope_chunks": int(embs.shape[0]), "scope_files": len(files)}
+        results.append({"path": cand_meta[ci]["path"], "chunk": int(cand_meta[ci]["chunk"]),
+                        "score": round(float(r["score"]), 4), "text": cand_meta[ci]["text"]})
+    return {"results": results, "scope_chunks": len(meta), "embedded_chunks": len(cand_meta),
+            "reranked_chunks": len(cand_texts), "scope_files": len(files)}
 
 
 @app.post("/embed")
@@ -751,17 +844,48 @@ async def cluster(req: Request):
                         for c, m in enumerate(clusters)]}
 
 
-@app.post("/stats")
-async def stats(_: Request):
+def _stats_payload():
     """List the dataroom files. Does NOT embed anything - there is no boot index."""
     files = sorted(os.path.relpath(f, DATAROOM_DIR) for f in _dataroom_files())
     return {"files": files, "file_count": len(files),
-            "embedded_scopes": len(_scope_cache),
+            "embedded_scopes": len(_scope_cache), "text_scopes": len(_text_scope_cache),
             "embed_cache": dict(_embed_cache_stats, unique=len(_embed_cache)),
             "embed_backend": EMBED_BACKEND, "rerank_backend": RERANK_BACKEND,
             "embed_model": API_EMBED_MODEL if EMBED_BACKEND == "api" else EMBED_MODEL,
             "rerank_model": API_RERANK_MODEL if RERANK_BACKEND == "api" else RERANK_MODEL,
             "dataroom_dir": DATAROOM_DIR}
+
+
+@app.get("/stats")
+async def stats_get():
+    return _stats_payload()
+
+
+@app.post("/stats")
+async def stats(_: Request):
+    return _stats_payload()
+
+
+@app.post("/warmup")
+async def warmup(req: Request):
+    """Load local models before Pi can issue parallel retrieval calls.
+
+    Cold CPU model downloads can exceed the JS fetch window if the agent's first turn fires
+    several search tools at once. Warming here makes startup pay that cost explicitly and gives
+    the orchestrator a clear boot/warmup failure instead of opaque `fetch failed` tool results.
+    """
+    body = await req.json()
+    out = {"embed_backend": EMBED_BACKEND, "rerank_backend": RERANK_BACKEND}
+    if body.get("embed", True) and EMBED_BACKEND != "api":
+        t0 = time.time()
+        _encode(["warmup query"], role="query")
+        _encode(["warmup passage"], role="passage")
+        out["embed_warmup_seconds"] = round(time.time() - t0, 2)
+    if body.get("rerank", False) and RERANK_BACKEND != "api":
+        t0 = time.time()
+        _rerank_texts("warmup query", ["warmup passage"], top_n=1)
+        out["rerank_warmup_seconds"] = round(time.time() - t0, 2)
+    return out
 
 
 if __name__ == "__main__":

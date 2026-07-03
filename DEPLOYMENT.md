@@ -14,7 +14,7 @@ This project is deployed on the same non-GPU DigitalOcean Droplet as dataroom.
 - Local app port: `8001`
 - Public hostname prepared in Caddy: `searchbox.tryalexandria.fr`
 
-The deployment is CPU-only and uses the remote Scaleway OpenAI-compatible LLM plus Jina API embedding/reranker settings from `.env`. There is no local LLM inference on the droplet.
+The deployment is CPU-only and uses the remote Scaleway OpenAI-compatible LLM plus local CPU embedding/reranker settings from `.env`. There is no local LLM inference on the droplet, and no Jina API key is required for the default retrieval path.
 
 ## Runtime Layout
 
@@ -182,7 +182,7 @@ curl -k -u "$AUTH" --resolve searchbox.tryalexandria.fr:443:142.93.173.1 https:/
 # {"ok": true}
 ```
 
-Jina API access from the droplet was verified separately through the dataroom deployment. Scaleway non-streaming Chat Completions was verified from the droplet with the deployed env and returned `HTTP 200`. Direct Scaleway tool-calling was also verified with the selected model.
+Local retrieval model loading should be verified after dependency/env changes. Scaleway non-streaming Chat Completions was verified from the droplet with the deployed env and returned `HTTP 200`. Direct Scaleway tool-calling was also verified with the selected model.
 
 Searchbox smoke job submitted through Caddy with the Scaleway dataroom zip from dataroom job `38ce7c64d890`:
 

@@ -77,9 +77,8 @@ Jina cloud API** (`EMBED_BACKEND` / `RERANK_BACKEND` = `local` | `api`):
 - **Local GPU with auto-CPU-offload**: `EMBED_DEVICE=cuda` runs retrieval on the GPU, but if the
   card lacks headroom (a colocated agent LLM already filled VRAM) the loader checks free VRAM
   against `MIN_FREE_VRAM_MB` (default 1500) and transparently falls back to CPU instead of OOMing;
-  CUDA OOM at load time is caught too. `EMBED_DEVICE=cpu` (default) keeps all VRAM for the LLM.
-  This is why a single 24 GB box running the agent LLM serves retrieval through the API backend
-  (the weights would not fit alongside the LLM), while idle/larger boxes run everything locally.
+  CUDA OOM at load time is caught too. `EMBED_DEVICE=cpu` (default) keeps all VRAM for the LLM
+  and is the recommended path when the agent LLM is remote or the host has no GPU.
 
 The retrieval models are the *same two* whether you pick `local` or `api` - only where embed/rerank
 runs changes (a clean local-vs-api ablation axis). Embeddings are L2-normalized on both paths

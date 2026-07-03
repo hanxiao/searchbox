@@ -2,8 +2,9 @@
 """Orchestrator: run one searchbox job on a minimal Pi harness.
 
 Inputs: a PROMPT, a DATAROOM (.zip or folder), and a BUDGET in TURNS.
-The agent answers the prompt grounded ONLY in the dataroom, using two local-only retrieval tools
-(jina-embeddings-v5-text-small + jina-reranker-v3 over the dataroom). No web.
+The agent answers the prompt grounded primarily in the dataroom, using local retrieval tools
+over the dataroom. When LINKUP_API_KEY is configured, Linkup fast search/fetch tools are also
+available for current web context explicitly needed by the task.
 
 DESIGN: keep it minimal. Pi is already a complete agent (it loops, calls tools, and
 auto-compacts its own context). We add exactly ONE thing on top of vanilla Pi: do not let the
@@ -30,6 +31,7 @@ ABLATION (all via env, no code edits):
   base model : LLAMA_URL / MODEL_ID / CONTEXT_WINDOW
   tools      : SEARCHBOX_TOOLS="sentence_embed,passage_rerank" | "sentence_embed" | "" (none)
   retrieval  : EMBED_MODEL / RERANK_MODEL
+  web         : LINKUP_API_KEY enables linkup_search/linkup_fetch (fast search only)
   budget     : TURN_BUDGET (number of turns)
 """
 import argparse, json, os, subprocess, sys, time, zipfile, signal, socket, threading, urllib.request, urllib.error, shutil
@@ -136,6 +138,29 @@ def wait_http(url: str, timeout: int = 600) -> bool:
         except Exception:
             time.sleep(2)
     return False
+
+
+def _selected_tools() -> set[str] | None:
+    """External retrieval tools enabled for this run. None means extension defaults."""
+    raw = os.environ.get("SEARCHBOX_TOOLS")
+    if raw is None:
+        return None
+    return {t.strip() for t in raw.split(",") if t.strip()}
+
+
+def _should_warm_reranker() -> bool:
+    selected = _selected_tools()
+    if selected is None:
+        return True  # default catalog includes answer_question
+    return bool({"answer_question", "rerank", "passage_rerank", "dataroom_rerank"} & selected)
+
+
+def warm_dataroom(url: str, timeout: int = 1200) -> dict:
+    payload = json.dumps({"embed": True, "rerank": _should_warm_reranker()}).encode()
+    req = urllib.request.Request(f"{url}/warmup", data=payload, method="POST",
+                                 headers={"content-type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read())
 
 
 def _strip_single_wrapper(dataroom_dir: Path):
@@ -252,8 +277,10 @@ def answer_present(work_dir: Path) -> bool:
 SYSTEM_TASK_TMPL = (
     "Today is {today}.\n"
     "Answer the question below using the dataroom/ folder in your working directory as your "
-    "source. You have no network access. You can use all tools you have or build new tools or "
-    "workflow using existing tools.\n"
+    "primary source. You can use all tools you have or build new tools or workflow using "
+    "existing tools. If Linkup tools are available, use linkup_search/linkup_fetch only when "
+    "the dataroom is insufficient for current/open-web context or the task explicitly asks for "
+    "fresh web information; keep those sources distinct from dataroom evidence.\n"
     "\n"
     "IMPORTANT - how tools relate to your answer:\n"
     "- search_dataroom and answer_question are RETRIEVAL tools only. They return candidate "
@@ -299,6 +326,7 @@ def drive(job_dir, work_dir, agent_dir, dataroom_dir, args, budget):
     cmd = [pi_bin, "--mode", "rpc",
            "--no-skills",
            "--append-system-prompt", build_system_task(),
+           "--extension", str(REPO / "pi" / "extensions" / "linkup-web.ts"),
            "--extension", str(REPO / "pi" / "extensions" / "dataroom-search.ts")]
     # On resume, continue the prior pi session (same agent_dir) instead of starting fresh.
     # Bind to the EXACT session file rather than --continue ("most recent"): the token accounting
@@ -554,9 +582,10 @@ def drive(job_dir, work_dir, agent_dir, dataroom_dir, args, budget):
             if elapsed > args.max_seconds:
                 stop_reason = "ceiling_seconds"; break
 
-            # We captured this turn's answer above (ANSWER.md = model's final message text).
-            # Force-budget OFF: one natural pass is enough -> stop now.
-            if not args.force_budget:
+            # Force-budget OFF: stop after the first natural pass only when it actually wrote
+            # ANSWER.md. If the first pass only hit tool errors or scouting calls, keep nudging
+            # until an answer appears or the turn budget is spent.
+            if not args.force_budget and answer_present(work_dir):
                 stop_reason = "first_turn_done"; break
 
             # Force-budget ON: keep going until the TURN budget is used up.
@@ -642,13 +671,26 @@ def main():
     os.environ["DATAROOM_INDEX_URL"] = f"http://127.0.0.1:{port}"
     write_pi_config(agent_dir, llama_url)
     cs = boot_dataroom(job_dir, dataroom_dir, port)
-    if not wait_http(f"http://127.0.0.1:{port}/stats", int(os.environ.get("DATAROOM_BOOT_TIMEOUT", "600"))):
+    dataroom_url = f"http://127.0.0.1:{port}"
+    if not wait_http(f"{dataroom_url}/stats", int(os.environ.get("DATAROOM_BOOT_TIMEOUT", "600"))):
         print("ERROR: dataroom sidecar did not come up", file=sys.stderr)
         try:
             os.killpg(os.getpgid(cs.pid), signal.SIGTERM)
         except Exception:
             cs.terminate()
         write_run_meta(job_dir, stop_reason="error_dataroom_boot", turns=0, done=False)
+        sys.exit(3)
+    try:
+        warm = warm_dataroom(dataroom_url, int(os.environ.get("DATAROOM_WARMUP_TIMEOUT", "1200")))
+        print(f"[searchbox] dataroom warmup {json.dumps(warm)}", flush=True)
+    except Exception as e:
+        print(f"ERROR: dataroom sidecar warmup failed: {e}", file=sys.stderr)
+        try:
+            os.killpg(os.getpgid(cs.pid), signal.SIGTERM)
+        except Exception:
+            cs.terminate()
+        write_run_meta(job_dir, stop_reason="error_dataroom_warmup", turns=0, done=False,
+                       error=str(e)[:500])
         sys.exit(3)
 
     start = time.time()

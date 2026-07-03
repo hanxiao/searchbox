@@ -1,4 +1,4 @@
-# Searchbox app: reuse the dataroom image (torch + node + jina-cli + v5-nano cached), bump pi
+# Searchbox app: reuse the dataroom image (torch + node + cached local retrieval stack), bump pi
 # to the version searchbox pins, overlay searchbox source. CPU embedder; LLM via shared llama.
 FROM ghcr.io/hanxiao/dataroom:latest
 
@@ -28,6 +28,13 @@ COPY config /app/config
 COPY scripts /app/scripts
 COPY PI_VERSION /app/PI_VERSION
 
-ENV JOBS_DIR=/data/jobs EMBED_BACKEND=api RERANK_BACKEND=api MODEL_ID=qwen3.6 CONTEXT_WINDOW=131072 PORT=8001
+ENV JOBS_DIR=/data/jobs \
+    EMBED_BACKEND=local \
+    RERANK_BACKEND=local \
+    EMBED_MODEL=jinaai/jina-embeddings-v5-text-nano \
+    RERANK_MODEL=jinaai/jina-reranker-v2-base-multilingual \
+    MODEL_ID=qwen3.6 \
+    CONTEXT_WINDOW=131072 \
+    PORT=8001
 EXPOSE 8001
 CMD ["python","-m","server.app"]
