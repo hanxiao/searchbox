@@ -39,10 +39,11 @@ JINA_API_BASE = os.environ.get("JINA_API_BASE", "https://api.jina.ai/v1")
 API_EMBED_MODEL = os.environ.get("API_EMBED_MODEL", "jina-embeddings-v5-text-small")
 API_RERANK_MODEL = os.environ.get("API_RERANK_MODEL", "jina-reranker-v3")
 
-# Keep the LOCAL embedder/reranker off the GPU by default so the LLM owns VRAM (jina-v5
-# base+LoRA otherwise OOM a tight card). Set EMBED_DEVICE=cuda when there is headroom.
-EMBED_DEVICE = os.environ.get("EMBED_DEVICE", "cpu")
-if EMBED_DEVICE.startswith("cpu"):
+# Keep the LOCAL embedder/reranker off accelerators by default so the LLM owns VRAM (jina-v5
+# base+LoRA otherwise OOM a tight card). Set EMBED_DEVICE=cuda or EMBED_DEVICE=mps when there is
+# headroom. MPS is useful on Apple Silicon when the agent LLM is remote.
+EMBED_DEVICE = os.environ.get("EMBED_DEVICE", "cpu").lower()
+if not EMBED_DEVICE.startswith("cuda"):
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
 DATAROOM_DIR = os.path.abspath(os.environ.get("DATAROOM_DIR", "dataroom"))
@@ -91,6 +92,7 @@ app = FastAPI()
 
 _embed_model = None
 _rerank_model = None
+_force_cpu = {"embed": False, "rerank": False}
 # Lazy per-scope index cache: key (paths tuple, chunk_size, overlap) -> {embs, meta}. Built only
 # when /search is first called for that scope; nothing exists until the model asks. Cleared via
 # nothing - it just lives for the process. No boot index, no on-disk precompute.
@@ -106,13 +108,15 @@ _embed_cache_stats = {"hits": 0, "misses": 0}
 
 
 # --- models ------------------------------------------------------------------
-# OPENCLAW_LOCAL_OFFLOAD: resolve target device, auto-falling back to CPU when CUDA is
-# unavailable or has no usable free VRAM. EMBED_DEVICE=cuda asks for GPU; if the card is full
-# (e.g. a colocated llama-server took all VRAM) we run on CPU instead of OOMing.
-def _is_cuda_oom(e: Exception) -> bool:
+# OPENCLAW_LOCAL_OFFLOAD: resolve target device, auto-falling back to CPU when CUDA/MPS is
+# unavailable or has no usable headroom. EMBED_DEVICE=cuda asks for GPU; if the card is full
+# (e.g. a colocated llama-server took all VRAM) we run on CPU instead of OOMing. EMBED_DEVICE=mps
+# uses Apple Metal when PyTorch reports it available, with CPU fallback for unsupported ops.
+def _is_accelerator_error(e: Exception) -> bool:
     msg = str(e).lower()
     return ("out of memory" in msg or "cuda error" in msg or "cublas" in msg
-            or "no kernel image" in msg or ("alloc" in msg and "cuda" in msg))
+            or "no kernel image" in msg or ("alloc" in msg and "cuda" in msg)
+            or "mps" in msg or "metal" in msg)
 
 
 def _want_cuda() -> bool:
@@ -133,17 +137,42 @@ def _want_cuda() -> bool:
         return False
 
 
+def _want_mps() -> bool:
+    if not (EMBED_DEVICE.startswith("mps") or EMBED_DEVICE.startswith("metal")):
+        return False
+    try:
+        import torch
+        if torch.backends.mps.is_built() and torch.backends.mps.is_available():
+            return True
+        print("[dataroom] MPS requested but unavailable -> CPU", flush=True)
+        return False
+    except Exception as e:
+        print(f"[dataroom] MPS availability check failed ({e}) -> CPU", flush=True)
+        return False
+
+
+def _target_device(role: str) -> str:
+    if _force_cpu.get(role):
+        return "cpu"
+    if _want_mps():
+        return "mps"
+    if _want_cuda():
+        return "cuda"
+    return "cpu"
+
+
 def embed_model():
     global _embed_model
     if _embed_model is None:
         from sentence_transformers import SentenceTransformer
-        dev = "cuda" if _want_cuda() else "cpu"
+        dev = _target_device("embed")
         print(f"[dataroom] loading embed model {EMBED_MODEL} on {dev}", flush=True)
         try:
             _embed_model = SentenceTransformer(EMBED_MODEL, device=dev, trust_remote_code=True)
         except Exception as e:
-            if dev == "cuda" and _is_cuda_oom(e):
-                print(f"[dataroom] embed CUDA load failed ({e}); offloading to CPU", flush=True)
+            if dev != "cpu" and _is_accelerator_error(e):
+                _force_cpu["embed"] = True
+                print(f"[dataroom] embed {dev} load failed ({e}); offloading to CPU", flush=True)
                 _embed_model = SentenceTransformer(EMBED_MODEL, device="cpu", trust_remote_code=True)
             else:
                 raise
@@ -157,7 +186,8 @@ def rerank_model():
     global _rerank_model
     if _rerank_model is None:
         from transformers import AutoModel, AutoModelForSequenceClassification
-        print(f"[dataroom] loading rerank model {RERANK_MODEL}", flush=True)
+        dev = _target_device("rerank")
+        print(f"[dataroom] loading rerank model {RERANK_MODEL} on {dev}", flush=True)
         last = None
         m = None
         for loader in (AutoModel, AutoModelForSequenceClassification):
@@ -172,12 +202,13 @@ def rerank_model():
         if m is None:
             raise RuntimeError(f"could not load a reranker with .rerank() for {RERANK_MODEL}: {last}")
         m.eval()
-        if _want_cuda():
+        if dev != "cpu":
             try:
-                m = m.to("cuda")
+                m = m.to(dev)
             except Exception as e:
-                if _is_cuda_oom(e):
-                    print(f"[dataroom] rerank CUDA move failed ({e}); staying on CPU", flush=True)
+                if _is_accelerator_error(e):
+                    _force_cpu["rerank"] = True
+                    print(f"[dataroom] rerank {dev} move failed ({e}); staying on CPU", flush=True)
                 else:
                     raise
         _rerank_model = m
@@ -201,13 +232,8 @@ def _encode_api(texts, role: str) -> np.ndarray:
     return arr
 
 
-def _encode_raw(texts, role: str) -> np.ndarray:
-    """Encode with the retrieval adapter + role-specific prompt (query vs document).
-
-    Routes to the Jina cloud API when EMBED_BACKEND=api; otherwise the local model.
-    Degrades gracefully if a build lacks the named prompts (older/odd v5 packaging)."""
-    if EMBED_BACKEND == "api":
-        return _encode_api(texts, role)
+def _encode_local(texts, role: str) -> np.ndarray:
+    """Encode with the local retrieval adapter + role-specific prompt."""
     m = embed_model()
     wants = ["query"] if role == "query" else ["document", "passage"]
     available = set((getattr(m, "prompts", None) or {}).keys())
@@ -224,6 +250,26 @@ def _encode_raw(texts, role: str) -> np.ndarray:
         except (TypeError, ValueError, KeyError):
             continue
     return np.asarray(m.encode(texts, normalize_embeddings=True), dtype=np.float32)
+
+
+def _encode_raw(texts, role: str) -> np.ndarray:
+    """Encode with the retrieval adapter + role-specific prompt (query vs document).
+
+    Routes to the Jina cloud API when EMBED_BACKEND=api; otherwise the local model.
+    Degrades gracefully if a build lacks the named prompts (older/odd v5 packaging)."""
+    global _embed_model
+    if EMBED_BACKEND == "api":
+        return _encode_api(texts, role)
+    try:
+        return _encode_local(texts, role)
+    except Exception as e:
+        if _target_device("embed") != "cpu" and _is_accelerator_error(e):
+            dev = _target_device("embed")
+            _force_cpu["embed"] = True
+            _embed_model = None
+            print(f"[dataroom] embed {dev} inference failed ({e}); retrying on CPU", flush=True)
+            return _encode_local(texts, role)
+        raise
 
 
 def _encode(texts, role: str) -> np.ndarray:
@@ -542,6 +588,7 @@ async def embed(req: Request):
 
 def _rerank_texts(q: str, docs: list, top_n=None) -> list:
     """Cross-encoder rerank helper -> [{index,score,text}] sorted desc. index is into docs."""
+    global _rerank_model
     docs = list(docs)
     if not q or not docs:
         return []
@@ -554,9 +601,18 @@ def _rerank_texts(q: str, docs: list, top_n=None) -> list:
                  "text": (r.get("document") or {}).get("text", "") if isinstance(r.get("document"), dict)
                          else r.get("document", ""),
                  "index": int(r.get("index", -1))} for r in d.get("results", [])]
-    m = rerank_model()
     kwargs = {"top_n": int(top_n)} if top_n is not None else {}
-    ranked = m.rerank(q, docs, **kwargs)
+    try:
+        ranked = rerank_model().rerank(q, docs, **kwargs)
+    except Exception as e:
+        if _target_device("rerank") != "cpu" and _is_accelerator_error(e):
+            dev = _target_device("rerank")
+            _force_cpu["rerank"] = True
+            _rerank_model = None
+            print(f"[dataroom] rerank {dev} inference failed ({e}); retrying on CPU", flush=True)
+            ranked = rerank_model().rerank(q, docs, **kwargs)
+        else:
+            raise
     return [{"score": float(r.get("relevance_score", 0.0)),
              "text": r.get("document", ""), "index": int(r.get("index", -1))} for r in ranked]
 
@@ -585,11 +641,9 @@ async def rerank(req: Request):
                         else r.get("document", ""),
                 "index": int(r.get("index", -1))} for r in d.get("results", [])]
         return {"results": out}
-    m = rerank_model()
-    kwargs = {"top_n": int(top_n)} if top_n is not None else {}
-    ranked = m.rerank(q, docs, **kwargs)
-    out = [{"score": round(float(r.get("relevance_score", 0.0)), 4),
-            "text": r.get("document", ""), "index": int(r.get("index", -1))} for r in ranked]
+    ranked = _rerank_texts(q, docs, top_n=top_n)
+    out = [{"score": round(float(r.get("score", 0.0)), 4),
+            "text": r.get("text", ""), "index": int(r.get("index", -1))} for r in ranked]
     return {"results": out}
 
 

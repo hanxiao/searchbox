@@ -52,6 +52,20 @@ def free_port() -> int:
     return p
 
 
+def _openai_base_url(llama_url: str) -> str:
+    """Return the OpenAI-compatible API base URL Pi expects.
+
+    Local llama.cpp users usually set LLAMA_URL=http://host:port, while hosted OpenAI-compatible
+    providers often hand out a URL that already ends in /v1. Accept both forms.
+    """
+    base = (llama_url or "http://localhost:8080").rstrip("/")
+    return base if base.endswith("/v1") else f"{base}/v1"
+
+
+def _truthy_env(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def write_pi_config(agent_dir: Path, llama_url: str):
     """Per-job Pi config: default model = the configured local model.
 
@@ -68,16 +82,18 @@ def write_pi_config(agent_dir: Path, llama_url: str):
     ctx = int(os.environ.get("CONTEXT_WINDOW", os.environ.get("CTX_SIZE", "131072")))
     model_id = os.environ.get("MODEL_ID", "qwen3.6")
     max_tokens = int(os.environ.get("MAX_OUTPUT_TOKENS", "8192"))
+    api = os.environ.get("MODEL_API", os.environ.get("LLM_API", "openai-completions")).strip() or "openai-completions"
+    reasoning = _truthy_env("MODEL_REASONING") or _truthy_env("LLM_MODEL_REASONING")
     compaction_reserve = int(os.environ.get("COMPACTION_RESERVE_TOKENS", "40000"))
     compaction_keep_recent = int(os.environ.get("COMPACTION_KEEP_RECENT_TOKENS", "20000"))
     (agent_dir / "models.json").write_text(json.dumps({
         "providers": {
             "local": {
-                "baseUrl": f"{llama_url}/v1",
-                "api": "openai-completions",
+                "baseUrl": _openai_base_url(llama_url),
+                "api": api,
                 "apiKey": os.environ.get("LLAMA_API_KEY", "sk-local"),
                 "compat": {"supportsDeveloperRole": False, "supportsReasoningEffort": False},
-                "models": [{"id": model_id, "contextWindow": ctx, "maxTokens": max_tokens}],
+                "models": [{"id": model_id, "contextWindow": ctx, "maxTokens": max_tokens, "reasoning": reasoning}],
             }
         }
     }, indent=2))
@@ -223,7 +239,7 @@ def reconcile_answer(work_dir: Path) -> None:
 def answer_present(work_dir: Path) -> bool:
     reconcile_answer(work_dir)
     a = work_dir / "ANSWER.md"
-    return a.exists() and a.stat().st_size > 200
+    return a.exists() and bool(a.read_text(errors="ignore").strip())
 
 
 # The task instruction lives in the SYSTEM PROMPT (appended via --append-system-prompt), not in
@@ -278,7 +294,9 @@ def drive(job_dir, work_dir, agent_dir, dataroom_dir, args, budget):
     env = dict(os.environ)
     env["PI_CODING_AGENT_DIR"] = str(agent_dir)
     env["PI_SKIP_VERSION_CHECK"] = "1"
-    cmd = [os.environ.get("PI_BIN", "pi"), "--mode", "rpc",
+    repo_pi = REPO / "data" / "pi-cli" / "node_modules" / ".bin" / "pi"
+    pi_bin = os.environ.get("PI_BIN") or (str(repo_pi) if repo_pi.exists() else "pi")
+    cmd = [pi_bin, "--mode", "rpc",
            "--no-skills",
            "--append-system-prompt", build_system_task(),
            "--extension", str(REPO / "pi" / "extensions" / "dataroom-search.ts")]
